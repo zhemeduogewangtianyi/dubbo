@@ -72,6 +72,14 @@ import static org.apache.dubbo.registry.Constants.UNREGISTER;
 
 /**
  * RedisRegistry
+ *
+ * 使用Redis作为注册中心，其订阅发布实现方式与ZooKeeper不同。我们在Redis注册中心
+ * 的数据结构中已经了解到，Redis订阅发布使用的是过期机制和publish/subscribe通道。服务提
+ * 供者发布服务，首先会在Redis中创建一个key,然后在通道中发布一条register事件消息。 但服务的key写入Redis后，发布者需要周期性地刷新key过期时间，在RedisRegistry构造方
+ * 法中会启动一个expireExecutor定时调度线程池，不断调用deferExpired()方法去延续key
+ * 的超时时间。如果服务提供者服务宕机，没有续期，则key会因为超时而被Redis删除，服务
+ * 也就会被认定为下线
+ *
  */
 public class RedisRegistry extends FailbackRegistry {
 
@@ -119,8 +127,11 @@ public class RedisRegistry extends FailbackRegistry {
         this.root = group;
 
         this.expirePeriod = url.getParameter(SESSION_TIMEOUT_KEY, DEFAULT_SESSION_TIMEOUT);
+
+        //创建一个一直更新生命周期的线程池
         this.expireFuture = expireExecutor.scheduleWithFixedDelay(() -> {
             try {
+                //续期
                 deferExpired(); // Extend the expiration time
             } catch (Throwable t) { // Defensive fault tolerance
                 logger.error("Unexpected exception occur at defer expire time, cause: " + t.getMessage(), t);
@@ -129,18 +140,29 @@ public class RedisRegistry extends FailbackRegistry {
     }
 
     private void deferExpired() {
+        //获取本地缓存的所有已被注册的 key，遍历
         for (URL url : new HashSet<>(getRegistered())) {
             if (url.getParameter(DYNAMIC_KEY, true)) {
+                //获取 key
                 String key = toCategoryPath(url);
+                //对 key 进行续期
                 if (redisClient.hset(key, url.toFullString(), String.valueOf(System.currentTimeMillis() + expirePeriod)) == 1) {
+                    //续期返回 1 ，册说明 key 过期或者被删除了，这次算重新发布，在通道中广播
                     redisClient.publish(key, REGISTER);
                 }
             }
         }
+        //如果是服务治理中心，则清理过期的 key
         if (admin) {
             clean();
         }
     }
+
+    /**
+     * 生产者注册，不断自我续期
+     * 消费者订阅 RedisRegistry 接收变化通知
+     * 服务治理中心(dubbo-admin) 订阅 RedisRegister 清理过期的 key，并且不断接收 RedisRegistry 的通知
+     * */
 
     private void clean() {
         Set<String> keys = redisClient.scan(root + ANY_VALUE);
@@ -203,9 +225,12 @@ public class RedisRegistry extends FailbackRegistry {
     public void doRegister(URL url) {
         String key = toCategoryPath(url);
         String value = url.toFullString();
+        //计算过期时间
         String expire = String.valueOf(System.currentTimeMillis() + expirePeriod);
         try {
+            //向Redis中注册
             redisClient.hset(key, value, expire);
+            //在通道中发布注册事件
             redisClient.publish(key, REGISTER);
         } catch (Throwable t) {
             throw new RpcException("Failed to register service to redis registry. registry: " + url.getAddress() + ", service: " + url + ", cause: " + t.getMessage(), t);

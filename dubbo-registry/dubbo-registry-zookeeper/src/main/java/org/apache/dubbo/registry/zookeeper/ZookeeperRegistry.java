@@ -140,12 +140,15 @@ public class ZookeeperRegistry extends FailbackRegistry {
     @Override
     public void doSubscribe(final URL url, final NotifyListener listener) {
         try {
+            //订阅所有服务
             if (ANY_VALUE.equals(url.getServiceInterface())) {
                 String root = toRootPath();
                 ConcurrentMap<NotifyListener, ChildListener> listeners = zkListeners.computeIfAbsent(url, k -> new ConcurrentHashMap<>());
                 ChildListener zkListener = listeners.computeIfAbsent(listener, k -> (parentPath, currentChilds) -> {
+                    //子节点有变化会接收到通知，遍历所有子节点
                     for (String child : currentChilds) {
                         child = URL.decode(child);
+                        //子节点未被订阅，说明是新节点，要订阅
                         if (!anyServices.contains(child)) {
                             anyServices.add(child);
                             subscribe(url.setPath(child).addParameters(INTERFACE_KEY, child,
@@ -153,12 +156,15 @@ public class ZookeeperRegistry extends FailbackRegistry {
                         }
                     }
                 });
+                //创建持久节点，接下来订阅持久节点直接子节点
                 zkClient.create(root, false);
                 List<String> services = zkClient.addChildListener(root, zkListener);
                 if (CollectionUtils.isNotEmpty(services)) {
+                    //遍历所有子节点进行订阅
                     for (String service : services) {
                         service = URL.decode(service);
                         anyServices.add(service);
+                        //增加当前节点的订阅，返回该节点下所有子节点列表
                         subscribe(url.setPath(service).addParameters(INTERFACE_KEY, service,
                                 Constants.CHECK_KEY, String.valueOf(false)), listener);
                     }
@@ -166,18 +172,31 @@ public class ZookeeperRegistry extends FailbackRegistry {
             } else {
                 CountDownLatch latch = new CountDownLatch(1);
                 List<URL> urls = new ArrayList<>();
+                //根据 URL 的类别，获取一组要订阅的路径
                 for (String path : toCategoriesPath(url)) {
+                    //日和平 zkListener 缓存为空则创建缓存
                     ConcurrentMap<NotifyListener, ChildListener> listeners = zkListeners.computeIfAbsent(url, k -> new ConcurrentHashMap<>());
                     ChildListener zkListener = listeners.computeIfAbsent(listener, k -> new RegistryChildListenerImpl(url, k, latch));
                     if (zkListener instanceof RegistryChildListenerImpl) {
                         ((RegistryChildListenerImpl) zkListener).setLatch(latch);
                     }
                     zkClient.create(path, false);
+                    //订阅，返回该节点下的子路径并缓存
                     List<String> children = zkClient.addChildListener(path, zkListener);
                     if (children != null) {
                         urls.addAll(toUrlsWithEmpty(url, path, children));
                     }
                 }
+                /**
+                 * 回调 notifyListener，更新本地缓存信息
+                 *
+                 * org/apache/dubbo/registry/support/AbstractRegistry.java:416
+                 * 注意，此处会根据URL中的category属性值获取具体的类别：providers、routers、
+                 * consumers> configurators,然后拉取直接子节点的数据进行通知(notify)。如果是providers
+                 * 类别的数据，则订阅方会更新本地Directory管理的Invoker服务列表；如果是routers分类，则
+                 * 订阅方会更新本地路由规则列表；如果是 configuators 类别，则订阅方会更新或覆盖本地动态参
+                 * 数列表。
+                 * */
                 notify(url, listener, urls);
                 // tells the listener to run only after the sync notification of main thread finishes.
                 latch.countDown();
